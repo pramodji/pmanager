@@ -3,9 +3,17 @@
     Interactive console tool to display computer information with formatted, color-coded output.
     Shows an animated spinner and a progress bar while information is collected in the background.
 
+.PARAMETER ComputerName
+    Name of the computer to query. Defaults to local computer if not specified.
+
 USAGE
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\computerinfo.ps1
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\computerinfo.ps1 -ComputerName "COMPUTERNAME"
 #>
+
+param(
+    [string]$ComputerName = $env:COMPUTERNAME
+)
 
 #region Helpers
 
@@ -55,18 +63,23 @@ function Get-ColorByPercent {
 #region Background collector
 # Use a background job to gather system information while the main thread shows an animated progress bar
 $job = Start-Job -Name "Collect-SystemInfo" -ScriptBlock {
+        param($TargetComputer)
         try {
                 $result = [ordered]@{}
+                $cimParams = @{ ErrorAction = 'Stop' }
+                if ($TargetComputer -and $TargetComputer -ne $env:COMPUTERNAME) {
+                        $cimParams['ComputerName'] = $TargetComputer
+                }
 
                 # Basic info
-                $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
-                $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+                $os = Get-CimInstance @cimParams -ClassName Win32_OperatingSystem
+                $cs = Get-CimInstance @cimParams -ClassName Win32_ComputerSystem
 
-                $result.ComputerName = $env:COMPUTERNAME
+                $result.ComputerName = if ($cimParams.ContainsKey('ComputerName')) { $TargetComputer } else { $env:COMPUTERNAME }
                 $result.UserName     = $env:USERNAME
                 $result.OS           = "$($os.Caption) ($($os.Version))"
                 $result.Build        = $os.BuildNumber
-                $result.Architecture = (Get-CimInstance -ClassName Win32_Processor | Select-Object -First 1).AddressWidth
+                $result.Architecture = (Get-CimInstance @cimParams -ClassName Win32_Processor | Select-Object -First 1).AddressWidth
                 $result.Domain       = $cs.Domain
                 $result.LastBootUp   = $os.LastBootUpTime
 
@@ -85,7 +98,7 @@ $job = Start-Job -Name "Collect-SystemInfo" -ScriptBlock {
                 }
 
                 # CPU
-                $cpu = Get-CimInstance -ClassName Win32_Processor | Select-Object -First 1
+                $cpu = Get-CimInstance @cimParams -ClassName Win32_Processor | Select-Object -First 1
                 $result.CPU = @{
                         Name = $cpu.Name.Trim()
                         Cores = $cpu.NumberOfCores
@@ -107,7 +120,7 @@ $job = Start-Job -Name "Collect-SystemInfo" -ScriptBlock {
                 }
 
                 # Logical disks (fixed drives)
-                $disks = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=3" | ForEach-Object {
+                $disks = Get-CimInstance @cimParams -ClassName Win32_LogicalDisk -Filter "DriveType=3" | ForEach-Object {
                         [PSCustomObject]@{
                                 DeviceID = $_.DeviceID
                                 VolumeName = $_.VolumeName
@@ -120,7 +133,7 @@ $job = Start-Job -Name "Collect-SystemInfo" -ScriptBlock {
                 $result.Disks = $disks
 
                 # Network adapters with IP
-                $nics = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter "IPEnabled = True" | ForEach-Object {
+                $nics = Get-CimInstance @cimParams -ClassName Win32_NetworkAdapterConfiguration -Filter "IPEnabled = True" | ForEach-Object {
                         [PSCustomObject]@{
                                 Description = $_.Description
                                 MACAddress  = $_.MACAddress
@@ -146,7 +159,7 @@ $job = Start-Job -Name "Collect-SystemInfo" -ScriptBlock {
         } catch {
                 return @{ Error = $_.Exception.Message }
         }
-}
+} -ArgumentList $ComputerName
 #endregion
 
 #region Show animated progress while job runs
