@@ -12,7 +12,9 @@ USAGE
 #>
 
 param(
-    [string]$ComputerName = $env:COMPUTERNAME
+        [string]$ComputerName = $env:COMPUTERNAME,
+        [System.Management.Automation.PSCredential]
+        $Credential = $null
 )
 
 #region Helpers
@@ -61,15 +63,61 @@ function Get-ColorByPercent {
 #endregion
 
 #region Background collector
+# Pre-check remote access and optionally prompt for credentials
+## prefer a provided credential for non-interactive use
+$providedCred = $Credential
+if ($ComputerName -and $ComputerName -ne $env:COMPUTERNAME) {
+        try {
+                if (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) {
+                        if ($providedCred) {
+                                Get-WmiObject -Class Win32_OperatingSystem -ComputerName $ComputerName -Credential $providedCred -ErrorAction Stop | Out-Null
+                        } else {
+                                Get-WmiObject -Class Win32_OperatingSystem -ComputerName $ComputerName -ErrorAction Stop | Out-Null
+                        }
+                } else {
+                        if ($providedCred) {
+                                Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $ComputerName -Credential $providedCred -ErrorAction Stop | Out-Null
+                        } else {
+                                Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $ComputerName -ErrorAction Stop | Out-Null
+                        }
+                }
+        } catch {
+                $msg = $_.Exception.Message
+                if ($msg -match 'Access is denied' -or $_.Exception -is [System.UnauthorizedAccessException]) {
+                        Write-Host ("Access denied to {0}. Please provide administrator credentials." -f $ComputerName) -ForegroundColor Yellow
+                        # Only prompt interactively if no credential was supplied
+                        if (-not $providedCred) {
+                                $providedCred = Get-Credential -Message ("Enter admin credentials for {0}" -f $ComputerName)
+                        } else {
+                                Write-Host "Using provided credential to attempt access." -ForegroundColor Yellow
+                        }
+                        try {
+                                if (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) {
+                                        Get-WmiObject -Class Win32_OperatingSystem -ComputerName $ComputerName -Credential $providedCred -ErrorAction Stop | Out-Null
+                                } else {
+                                        Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $ComputerName -Credential $providedCred -ErrorAction Stop | Out-Null
+                                }
+                        } catch {
+                                Write-Host ("Credential validation failed: {0}" -f $_.Exception.Message) -ForegroundColor Red
+                                exit 1
+                        }
+                } else {
+                        Write-Host ("Error contacting {0}: {1}" -f $ComputerName, $msg) -ForegroundColor Red
+                        exit 1
+                }
+        }
+}
+
 # Use a background job to gather system information while the main thread shows an animated progress bar
 $job = Start-Job -Name "Collect-SystemInfo" -ScriptBlock {
-        param($TargetComputer)
+        param($TargetComputer, $TargetCred)
         try {
                 $result = [ordered]@{}
                 $cimParams = @{ ErrorAction = 'Stop' }
                 if ($TargetComputer -and $TargetComputer -ne $env:COMPUTERNAME) {
                         $cimParams['ComputerName'] = $TargetComputer
                 }
+                if ($TargetCred) { $cimParams['Credential'] = $TargetCred }
 
                 # Basic info
                 $os = Get-CimInstance @cimParams -ClassName Win32_OperatingSystem
@@ -144,14 +192,14 @@ $job = Start-Job -Name "Collect-SystemInfo" -ScriptBlock {
                 }
                 $result.Network = $nics
 
-                # Quick summary of services (just count running/paused/stopped as a sample)
-                $svcs = Get-Service | Group-Object -Property Status | ForEach-Object {
+                # Services summary via WMI (remote-friendly)
+                $svcs = Get-CimInstance @cimParams -ClassName Win32_Service | Group-Object -Property State | ForEach-Object {
                         [PSCustomObject]@{ Status = $_.Name; Count = $_.Count }
                 }
                 $result.Services = $svcs
 
-                # Installed hotfixes (may be slow) - keep limited to recent ones
-                $hotfixes = Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 10
+                # Installed hotfixes via WMI (remote-friendly)
+                $hotfixes = Get-CimInstance @cimParams -ClassName Win32_QuickFixEngineering | Sort-Object InstalledOn -Descending | Select-Object -First 10
                 $result.HotFixes = $hotfixes
 
                 # Return the assembled object
@@ -159,7 +207,7 @@ $job = Start-Job -Name "Collect-SystemInfo" -ScriptBlock {
         } catch {
                 return @{ Error = $_.Exception.Message }
         }
-} -ArgumentList $ComputerName
+} -ArgumentList $ComputerName, $providedCred
 #endregion
 
 #region Show animated progress while job runs
